@@ -1,0 +1,76 @@
+name: Deploy App with Nginx Config
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Install SSH Key
+        uses: shimataro/ssh-key-action@v2
+        with:
+          key: ${{ secrets.EC2_SSH_KEY }}
+          known_hosts: ${{ secrets.KNOWN_HOSTS }}
+      - name: Deploy Application
+        run: |
+          # Define variables
+          APP_NAME=myapp
+          SUBDOMAIN=myapp.example.com
+          PORT=8000
+
+          # SSH into EC2 and run the deployment commands
+          ssh -o StrictHostKeyChecking=no ubuntu@${{ secrets.EC2_HOST }} << 'EOF'
+            # Deploy Docker container
+            docker pull ${{ secrets.DOCKERHUB_USERNAME }}/$APP_NAME:latest
+            docker stop $APP_NAME || true
+            docker rm $APP_NAME || true
+            docker run -d --name $APP_NAME -p $PORT:$PORT ${{ secrets.DOCKERHUB_USERNAME }}/$APP_NAME:latest
+
+            # Automate Nginx configuration
+            echo "server {
+                listen 80;
+                server_name $SUBDOMAIN;
+
+                location / {
+                    proxy_pass http://127.0.0.1:$PORT;
+                    proxy_http_version 1.1;
+                    proxy_set_header Host \$host;
+                    proxy_set_header X-Real-IP \$remote_addr;
+                }
+            }" > /etc/nginx/sites-available/$APP_NAME.conf
+
+            ln -sf /etc/nginx/sites-available/$APP_NAME.conf /etc/nginx/sites-enabled/
+            nginx -t && systemctl reload nginx
+
+            # Install Certbot and configure SSL
+            if ! [ -x "$(command -v certbot)" ]; then
+                apt-get update
+                apt-get install -y certbot python3-certbot-nginx
+            fi
+            certbot --nginx -d $SUBDOMAIN --non-interactive --agree-tos -m ${{ secrets.CERTBOT_EMAIL }}
+          EOF
+      - name: Add DNS Record
+        run: |
+          aws route53 change-resource-record-sets \
+            --hosted-zone-id ${{ secrets.ROUTE53_ZONE_ID }} \
+            --change-batch file://<(cat << EOF
+            {
+              "Changes": [{
+                "Action": "UPSERT",
+                "ResourceRecordSet": {
+                  "Name": "$SUBDOMAIN",
+                  "Type": "A",
+                  "TTL": 300,
+                  "ResourceRecords": [{ "Value": "${{ secrets.EC2_IP }}" }]
+                }
+              }]
+            }
+            EOF
+            )
+        
