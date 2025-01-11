@@ -1,4 +1,4 @@
-name: Deploy Hello-Go to EC2 (with auto ECR creation)
+name: Deploy Hello Go to EC2 (with auto ECR creation)
 
 on:
   push:
@@ -12,6 +12,8 @@ jobs:
     env:
       APP_NAME: hello-go
       IMAGE_TAG: latest
+      AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+      AWS_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
 
     steps:
       # 1. Check out code
@@ -62,22 +64,25 @@ jobs:
       # 6. Update DNS Record in Route 53
       - name: Add DNS Record
         run: |
+          SUBDOMAIN="$APP_NAME.dapplux.com"
+          
           aws route53 change-resource-record-sets \
             --hosted-zone-id ${{ secrets.ROUTE53_ZONE_ID }} \
             --change-batch file://<(cat << EOF
-            {
-              "Changes": [{
-                "Action": "UPSERT",
-                "ResourceRecordSet": {
-                  "Name": "$APP_NAME.example.com",
-                  "Type": "A",
-                  "TTL": 300,
-                  "ResourceRecords": [{ "Value": "${{ secrets.EC2_IP }}" }]
-                }
-              }]
-            }
-            EOF
-            )
+          {
+            "Changes": [{
+              "Action": "UPSERT",
+              "ResourceRecordSet": {
+                "Name": "$SUBDOMAIN",
+                "Type": "A",
+                "TTL": 300,
+                "ResourceRecords": [{ "Value": "${{ secrets.EC2_IP }}" }]
+              }
+            }]
+          }
+          EOF
+              )
+    
 
       # 7. Install SSH Key
       - name: Install SSH Key
@@ -91,37 +96,76 @@ jobs:
         env:
           AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
           AWS_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+          APP_NAME: new-project
+          IMAGE_TAG: latest
+          PORT: 8081
         run: |
-          ECR_REGISTRY="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
-          SUBDOMAIN="$APP_NAME.example.com"
-          PORT=8080
-
-          ssh -o StrictHostKeyChecking=no ubuntu@${{ secrets.EC2_HOST }} << 'EOF'
-            docker pull $ECR_REGISTRY/$APP_NAME:$IMAGE_TAG
-
-            docker stop $APP_NAME || true
-            docker rm $APP_NAME || true
-
-            docker run -d --name $APP_NAME -p 8080:8080 $ECR_REGISTRY/$APP_NAME:$IMAGE_TAG
-
-            echo "server {
-                listen 80;
-                server_name $SUBDOMAIN;
-
-                location / {
-                    proxy_pass http://127.0.0.1:8080;
-                    proxy_http_version 1.1;
-                    proxy_set_header Host \$host;
-                    proxy_set_header X-Real-IP \$remote_addr;
-                }
-            }" > /etc/nginx/sites-available/$APP_NAME.conf
-
-            ln -sf /etc/nginx/sites-available/$APP_NAME.conf /etc/nginx/sites-enabled/
-            nginx -t && systemctl reload nginx
-
-            if ! [ -x "$(command -v certbot)" ]; then
-              apt-get update
-              apt-get install -y certbot python3-certbot-nginx
+          # Compute registry and subdomain locally, so we can expand them here:
+          ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          SUBDOMAIN="${APP_NAME}.dapplux.com"
+      
+          ssh -o StrictHostKeyChecking=no ubuntu@${{ secrets.EC2_HOST }} <<EOF
+            # Export AWS credentials on the remote environment
+            export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID}"
+            export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY}"
+            export AWS_DEFAULT_REGION="${AWS_REGION}"
+      
+            # Log in to ECR
+            aws ecr get-login-password --region "${AWS_REGION}" \
+              | sudo docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+      
+            # Pull the Docker image
+            sudo docker pull "${ECR_REGISTRY}/${APP_NAME}:${IMAGE_TAG}"
+      
+            # Stop and remove any old container
+            sudo docker stop "${APP_NAME}" || true
+            sudo docker rm "${APP_NAME}" || true
+      
+            # Run the new container (listening on port 8080 in the container)
+            sudo docker run -d --name "${APP_NAME}" -p ${PORT}:8080 "${ECR_REGISTRY}/${APP_NAME}:${IMAGE_TAG}"
+      
+            # Create Nginx config (ESCAPE the $ so Nginx sees them literally!)
+            cat <<EOL | sudo tee /etc/nginx/sites-available/${APP_NAME}.conf
+          server {
+              listen 80;
+              server_name ${SUBDOMAIN};
+          
+              location / {
+                  return 301 https://\\\$host\\\$request_uri;
+              }
+          }
+          
+          server {
+              listen 443 ssl;
+              server_name ${SUBDOMAIN};
+          
+              ssl_certificate /etc/letsencrypt/live/${SUBDOMAIN}/fullchain.pem;
+              ssl_certificate_key /etc/letsencrypt/live/${SUBDOMAIN}/privkey.pem;
+              include /etc/letsencrypt/options-ssl-nginx.conf;
+              ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+          
+              location / {
+                  proxy_pass http://127.0.0.1:${PORT};
+                  proxy_http_version 1.1;
+                  proxy_set_header Host "\\\$host";
+                  proxy_set_header X-Real-IP "\\\$remote_addr";
+                  proxy_set_header X-Forwarded-For "\\\$proxy_add_x_forwarded_for";
+              }
+          }
+          EOL
+            
+          # Install certbot if not present
+            if ! [ -x "/usr/bin/certbot" ]; then
+              sudo apt-get update
+              sudo apt-get install -y certbot python3-certbot-nginx
             fi
-            certbot --nginx -d $SUBDOMAIN --non-interactive --agree-tos -m ${{ secrets.CERTBOT_EMAIL }}
+            sudo systemctl stop nginx
+            # Generate SSL certificate using certbot
+            sudo certbot certonly --standalone -d ${SUBDOMAIN} -m ${{ secrets.CERTBOT_EMAIL }} --agree-tos --non-interactive
+            
+            # Enable the site in Nginx
+            sudo ln -sf /etc/nginx/sites-available/${APP_NAME}.conf /etc/nginx/sites-enabled/
+            sudo systemctl stop nginx && sudo nginx -t
+      
           EOF
+      
